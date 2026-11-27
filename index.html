@@ -158,7 +158,15 @@ const DEFAULT_SKILLS=[
   {name:"traducir",prompt:"Tradúcelo al inglés manteniendo el tono."},
   {name:"critica",prompt:"Hazme una crítica honesta: qué es sólido, qué es dudoso y qué falta."}
 ];
-let settings=Object.assign({key:"",model:"claude-sonnet-5-5",name:""},store.get("dia.settings",{}));
+const PROVIDERS={
+  openrouter:{name:"OpenRouter (modelos :free)",needKey:true,url:"https://openrouter.ai/api/v1",def:"",hint:"Clave gratis en openrouter.ai/keys. Pulsa «Cargar modelos» y elige uno que acabe en :free."},
+  groq:{name:"Groq (gratis, muy rápido)",needKey:true,url:"https://api.groq.com/openai/v1",def:"llama-3.3-70b-versatile",hint:"Clave gratis en console.groq.com/keys."},
+  gemini:{name:"Google Gemini (gratis con límites)",needKey:true,url:"https://generativelanguage.googleapis.com/v1beta/openai",def:"gemini-2.0-flash",hint:"Clave gratis en aistudio.google.com/apikey."},
+  anthropic:{name:"Anthropic Claude (de pago)",needKey:true,def:"claude-sonnet-5-5",hint:"Clave en console.anthropic.com. Se cobra por uso."}
+};
+let settings=Object.assign({provider:"openrouter",keys:{},models:{},name:"",key:"",model:""},store.get("dia.settings",{}));
+if(settings.key){settings.keys.anthropic=settings.keys.anthropic||settings.key;settings.models.anthropic=settings.models.anthropic||settings.model||"";settings.provider=store.get("dia.settings",{}).provider||"anthropic";delete settings.key;delete settings.model}
+const curModel=()=>settings.models[settings.provider]||PROVIDERS[settings.provider].def;
 let skills=store.get("dia.skills",DEFAULT_SKILLS);
 const mkTab=()=>({id:Math.random().toString(36).slice(2,9),url:"",title:"Nueva pestaña",msgs:[],all:false});
 let S=store.get("dia.state",null);
@@ -265,7 +273,9 @@ async function buildContext(t,onStatus){
 /* ---------- Claude ---------- */
 async function ask(text){
   const t=tab();
-  if(!settings.key){openSettings("Añade tu API key de Anthropic para chatear.");return}
+  const P=PROVIDERS[settings.provider],key=settings.keys[settings.provider]||"";
+  if(P.needKey&&!key){openSettings("Añade la clave de "+P.name+" para chatear.");return}
+  if(!curModel()){openSettings("Elige un modelo (pulsa «Cargar modelos»).");return}
   if(busy)return;
   if(isPage(t))sheetOpen=true;
   t.msgs.push({role:"user",content:text});
@@ -278,12 +288,17 @@ async function ask(text){
     ai.status="Pensando";patchLast();
     const system=`Eres Claude, el asistente integrado en un navegador estilo Dia, en un iPhone. Responde en el idioma del usuario, de forma clara y breve (pantalla pequeña). Usa Markdown ligero.`+(ctx?`\n\nContenido de las pestañas abiertas del usuario (úsalo como contexto, cita la fuente si ayuda):\n\n${ctx}`:"");
     const history=t.msgs.slice(0,-1).filter(m=>!m.err&&m.content).map(m=>({role:m.role,content:m.content}));
-    const res=await fetch("https://api.anthropic.com/v1/messages",{
+    const isA=settings.provider==="anthropic";
+    const res=isA?await fetch("https://api.anthropic.com/v1/messages",{
       method:"POST",signal:abortCtl.signal,
-      headers:{"content-type":"application/json","x-api-key":settings.key,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-      body:JSON.stringify({model:settings.model,max_tokens:2048,stream:true,system,messages:history})
+      headers:{"content-type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+      body:JSON.stringify({model:curModel(),max_tokens:2048,stream:true,system,messages:history})
+    }):await fetch(P.url+"/chat/completions",{
+      method:"POST",signal:abortCtl.signal,
+      headers:Object.assign({"content-type":"application/json"},key?{authorization:"Bearer "+key}:{}),
+      body:JSON.stringify({model:curModel(),max_tokens:2048,stream:true,messages:[{role:"system",content:system},...history]})
     });
-    if(!res.ok){let m=res.status+"";try{m=(await res.json()).error.message}catch{}throw new Error(m)}
+    if(!res.ok){let m="HTTP "+res.status;try{const j=await res.json();const e=j.error;m=(typeof e==="string"?e:e&&e.message)||m}catch{}throw new Error(m)}
     const rd=res.body.getReader(),dec=new TextDecoder();let buf="",raf=0;
     ai.status="";
     while(true){
@@ -292,8 +307,13 @@ async function ask(text){
       let i;while((i=buf.indexOf("\n"))>=0){
         const line=buf.slice(0,i).trim();buf=buf.slice(i+1);
         if(!line.startsWith("data:"))continue;
+        if(line.slice(5).trim()==="[DONE]")continue;
         try{const ev=JSON.parse(line.slice(5));
-          if(ev.type==="content_block_delta"&&ev.delta.type==="text_delta"){
+          if(ev.choices){
+            const d=ev.choices[0]&&ev.choices[0].delta&&ev.choices[0].delta.content;
+            if(d){ai.content+=d;if(!raf)raf=requestAnimationFrame(()=>{raf=0;patchLast()})}
+          }else if(ev.error)throw new Error(ev.error.message||"error");
+          else if(ev.type==="content_block_delta"&&ev.delta.type==="text_delta"){
             ai.content+=ev.delta.text;
             if(!raf)raf=requestAnimationFrame(()=>{raf=0;patchLast()});
           }else if(ev.type==="error")throw new Error(ev.error.message);
@@ -409,26 +429,62 @@ function openSettings(msg){
   $("#stForm").innerHTML=`
     ${msg?`<div class="msg err" style="margin-top:8px">${esc(msg)}</div>`:""}
     <label>Tu nombre (opcional)</label><input id="sName" value="${esc(settings.name)}">
-    <label>API key de Anthropic</label><input id="sKey" type="password" placeholder="sk-ant-…" value="${esc(settings.key)}" autocapitalize="off" autocorrect="off">
-    <div class="note">Se guarda solo en este iPhone (localStorage) y se envía únicamente a api.anthropic.com.</div>
-    <label>Modelo</label><select id="sModel">${MODELS.map(([v,n])=>`<option value="${v}" ${v===settings.model?"selected":""}>${n}</option>`).join("")}</select>
+    <label>Proveedor de IA</label><select id="sProv">${Object.entries(PROVIDERS).map(([k,p])=>`<option value="${k}" ${k===settings.provider?"selected":""}>${esc(p.name)}</option>`).join("")}</select>
+    <div class="note" id="sHint"></div>
+    <div id="sKeyWrap"><label>Clave (API key)</label><input id="sKey" type="password" placeholder="pega tu clave" autocapitalize="off" autocorrect="off"></div>
+    <label>Modelo</label><input id="sModel" list="mlist" autocapitalize="off" autocorrect="off" placeholder="id del modelo"><datalist id="mlist"></datalist>
+    <button class="btn sec" id="sLoad" style="margin-top:8px;padding:8px 12px">Cargar modelos</button> <span class="note" id="sLoadMsg"></span>
+    <div class="note">La clave se guarda solo en este iPhone y se envía únicamente al proveedor elegido.</div>
     <label>Skills (se usan escribiendo /nombre)</label>
     <div id="sSkills">${skills.map((s,i)=>`<div class="skill"><input data-sn="${i}" value="${esc(s.name)}" placeholder="nombre"><textarea data-sp="${i}" placeholder="instrucción">${esc(s.prompt)}</textarea><button class="btn red" data-sdel="${i}" style="margin-top:8px;padding:8px 12px">Eliminar</button></div>`).join("")}</div>
     <button class="btn sec" id="sAdd">+ Añadir skill</button>
     <button class="btn red" id="sWipe" style="display:block;width:100%">Borrar pestañas y chats</button>
     <div class="note" style="margin-top:14px">Leer páginas usa r.jina.ai (envía la URL a ese servicio para extraer el texto). Muchas webs no se pueden mostrar dentro de la app; ábrelas en Safari y Claude sigue pudiendo leerlas.</div>`;
   $("#settings").classList.add("show");
+  fillProv();
+}
+function fillProv(){
+  const p=settings.provider,P=PROVIDERS[p];
+  $("#sHint").textContent=P.hint;
+  $("#sKeyWrap").style.display=P.needKey?"block":"none";
+  $("#sKey").value=settings.keys[p]||"";
+  $("#sModel").value=settings.models[p]||P.def;
+  $("#mlist").innerHTML=p==="anthropic"?MODELS.map(([v,n])=>`<option value="${v}">${n}</option>`).join(""):"";
+  $("#sLoad").style.display=p==="anthropic"?"none":"inline-block";
+  $("#sLoadMsg").textContent="";
+}
+async function loadModels(){
+  const p=settings.provider,P=PROVIDERS[p],key=$("#sKey").value.trim(),msg=$("#sLoadMsg");
+  if(P.needKey&&p!=="openrouter"&&!key){msg.textContent="Pega primero la clave.";return}
+  msg.textContent="Cargando…";
+  try{
+    const r=await fetch(P.url+"/models",{headers:key?{authorization:"Bearer "+key}:{}});
+    if(!r.ok)throw new Error(r.status);
+    let ids=((await r.json()).data||[]).map(m=>m.id.replace(/^models\//,""));
+    if(p==="openrouter")ids=ids.filter(i=>i.endsWith(":free"));
+    $("#mlist").innerHTML=ids.map(i=>`<option value="${esc(i)}">`).join("");
+    if(p==="openrouter"&&ids.length&&!ids.includes($("#sModel").value))$("#sModel").value=ids[0];
+    msg.textContent=ids.length+" modelos. Toca el campo Modelo para elegir.";
+  }catch(e){msg.textContent="No se pudo cargar ("+e.message+")."}
 }
 function readSettings(){
-  settings.name=$("#sName").value.trim();settings.key=$("#sKey").value.trim();settings.model=$("#sModel").value;
+  const p=settings.provider;
+  settings.name=$("#sName").value.trim();settings.keys[p]=$("#sKey").value.trim();settings.models[p]=$("#sModel").value.trim();
   skills=[...document.querySelectorAll("[data-sn]")].map((n,i)=>({name:n.value.trim().replace(/\s+/g,"-"),prompt:document.querySelector(`[data-sp="${i}"]`).value.trim()})).filter(s=>s.name&&s.prompt);
   save();
 }
 $("#menuBtn").onclick=()=>openSettings();
 $("#stClose").onclick=()=>{readSettings();$("#settings").classList.remove("show");render()};
+$("#stForm").addEventListener("change",e=>{
+  if(e.target.id==="sProv"){
+    const p=settings.provider;settings.keys[p]=$("#sKey").value.trim();settings.models[p]=$("#sModel").value.trim();
+    settings.provider=e.target.value;fillProv();save();
+  }
+});
 $("#stForm").addEventListener("click",e=>{
   const b=e.target.closest("button");if(!b)return;
-  if(b.id==="sAdd"){readSettings();skills.push({name:"nueva",prompt:"Haz esto: "});openSettings()}
+  if(b.id==="sLoad")loadModels();
+  else if(b.id==="sAdd"){readSettings();skills.push({name:"nueva",prompt:"Haz esto: "});openSettings()}
   else if(b.dataset.sdel!==undefined){readSettings();skills.splice(+b.dataset.sdel,1);save();openSettings()}
   else if(b.id==="sWipe"&&confirm("¿Borrar todas las pestañas y conversaciones?")){const t=mkTab();S={tabs:[t],active:t.id};save();$("#settings").classList.remove("show");render()}
 });
